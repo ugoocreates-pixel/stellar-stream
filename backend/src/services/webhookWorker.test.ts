@@ -513,6 +513,56 @@ describe("WebhookWorker", () => {
       // Verify no remaining active deliveries
       expect(db.prepare("SELECT count(*) as count FROM webhook_deliveries").get()).toEqual({ count: 0 });
     });
+
+    it("recovers safely when worker restart or transaction failure interrupts dead-letter transition (SSB-2026-157)", async () => {
+      const db = getDb();
+      const baseTime = Math.floor(Date.now() / 1000);
+
+      // Queue delivery at final attempt (attempt = 2, max_attempts = 3)
+      db.prepare(`
+        INSERT INTO webhook_deliveries (stream_id, event, payload, attempt, max_attempts, status, next_retry_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run("s1", "stream.created", JSON.stringify({ stream_id: "s1" }), 2, 3, "pending", baseTime - 10, baseTime - 10);
+
+      const delivery = db.prepare("SELECT * FROM webhook_deliveries WHERE stream_id = ?").get("s1") as any;
+
+      // Simulate failure during dead-letter transition (e.g. worker crash / abort / trigger failure)
+      db.exec(`
+        CREATE TRIGGER fail_dead_letter_insert
+        BEFORE INSERT ON webhook_dead_letters
+        BEGIN
+          SELECT RAISE(ABORT, 'forced dead letter transition failure');
+        END;
+      `);
+
+      (axios.post as any).mockResolvedValueOnce({ status: 500 });
+
+      try {
+        await processWebhookQueue();
+
+        // Transaction must roll back atomically: delivery remains in active queue and is not lost
+        const active = db.prepare("SELECT * FROM webhook_deliveries WHERE id = ?").get(delivery.id) as any;
+        expect(active).toBeDefined();
+        expect(active.status).toBe("pending");
+        // No orphaned dead letters or duplicate state created
+        expect(countDeadLetters()).toBe(0);
+      } finally {
+        db.exec("DROP TRIGGER IF EXISTS fail_dead_letter_insert");
+      }
+
+      // After worker restart/recovery, retry or next processing run can complete the transition cleanly
+      (axios.post as any).mockResolvedValueOnce({ status: 500 });
+      await processWebhookQueue();
+
+      const activeAfterRestart = db.prepare("SELECT * FROM webhook_deliveries WHERE id = ?").get(delivery.id);
+      expect(activeAfterRestart).toBeUndefined();
+
+      expect(countDeadLetters()).toBe(1);
+      const deadLetter = db.prepare("SELECT * FROM webhook_dead_letters WHERE stream_id = ?").get("s1") as any;
+      expect(deadLetter).toBeDefined();
+      expect(deadLetter.event).toBe("stream.created");
+      expect(deadLetter.last_error).toBe("HTTP 500");
+    });
   });
 });
 
